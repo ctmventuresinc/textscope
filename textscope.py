@@ -153,8 +153,26 @@ def search_messages(handles, keywords):
             if norm:
                 target_phones.add(norm)
 
-    # Query all messages
-    sql = """
+    # Build WHERE clause to filter by handle directly in SQL
+    handle_conditions = []
+    params = []
+    for h in handles:
+        if "@" in h:
+            handle_conditions.append("LOWER(h.id) = ?")
+            params.append(h.lower())
+        else:
+            # Match phone numbers with LIKE to handle +1 prefix etc
+            norm = normalize_phone(h)
+            if norm:
+                handle_conditions.append("h.id LIKE ?")
+                params.append(f"%{norm[-10:]}")
+
+    if not handle_conditions:
+        return {"results": [], "total_searched": 0}
+
+    where_handles = " OR ".join(handle_conditions)
+
+    sql = f"""
         SELECT
             (m.date/1000000000+978307200) AS ts,
             h.id AS handle,
@@ -166,23 +184,17 @@ def search_messages(handles, keywords):
         JOIN handle h ON m.handle_id = h.ROWID
         LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-        WHERE m.text IS NOT NULL OR m.attributedBody IS NOT NULL
+        WHERE ({where_handles})
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
         ORDER BY (m.date/1000000000+978307200) DESC
     """
-    rows = db_query(sql)
+    rows = db_query(sql, tuple(params))
 
     contacts = extract_contacts()
     results = []
-    total_searched = 0
+    total_searched = len(rows)
 
     for ts, handle, text, is_from_me, chat_name, attr_body in rows:
-        handle_phone = normalize_phone(handle)
-        handle_lower = (handle or "").lower()
-        is_target = handle_phone in target_phones or handle_lower in target_emails
-        if not is_target:
-            continue
-
-        total_searched += 1
 
         # Extract text from attributedBody if text column is empty
         msg_text = text or ""
@@ -192,21 +204,28 @@ def search_messages(handles, keywords):
                 idx = part.find(b"NSDictionary")
                 if idx > 0:
                     part = part[:idx]
-                msg_text = part.decode("utf-8", errors="replace").strip()
+                msg_text = re.sub(r'[^\x20-\x7e]+', '', part.decode("utf-8", errors="replace")).strip()
             except Exception:
                 pass
 
         # Extract URLs from attributedBody
         extra_urls = []
         if attr_body:
-            extra_urls = [
-                u.decode("utf-8", errors="replace")
-                for u in re.findall(rb'https?://[^\x00-\x20\x7f-\x9f"<>]+', attr_body)
-            ]
+            raw_urls = re.findall(rb'https?://[a-zA-Z0-9_.~:/?#\[\]@!$&\'()*+,;=%-]+', attr_body)
+            for u in raw_urls:
+                decoded = u.decode("ascii", errors="ignore").strip()
+                if decoded and len(decoded) > 8:
+                    extra_urls.append(decoded)
 
-        # Find all URLs
+        # Find all URLs and deduplicate — if one URL starts with another, keep the shorter one
         urls = url_re.findall(msg_text)
-        all_urls = list(set(urls + extra_urls))
+        combined = sorted(set(urls + extra_urls), key=len)
+        all_urls = []
+        for u in combined:
+            if not any(u.startswith(existing) and u != existing for existing in all_urls):
+                # Remove any longer URLs that this one is a prefix of
+                all_urls = [e for e in all_urls if not e.startswith(u)]
+                all_urls.append(u)
 
         # Check keywords — search both URLs and message text
         kw_lower = [k.lower().strip() for k in keywords if k.strip()]
