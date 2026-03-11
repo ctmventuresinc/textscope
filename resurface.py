@@ -176,26 +176,41 @@ def dedup_urls(urls):
     return result
 
 
-def search_messages(handles, keywords):
-    """Search messages from given handles for URLs/text matching keywords."""
+def search_messages(handles, keywords, days=365):
+    """Search messages for URLs/text matching keywords. If handles is empty, search all."""
     url_re = re.compile(URL_REGEX)
 
-    handle_conditions = []
-    params = []
-    for h in handles:
-        if "@" in h:
-            handle_conditions.append("LOWER(h.id) = ?")
-            params.append(h.lower())
-        else:
-            norm = normalize_phone(h)
-            if norm:
-                handle_conditions.append("h.id LIKE ?")
-                params.append(f"%{norm[-10:]}")
+    cutoff_ts = int((datetime.now() - timedelta(days=days)).timestamp()) - 978307200
+    cutoff_apple = cutoff_ts * 1000000000
 
-    if not handle_conditions:
-        return {"results": [], "total_searched": 0}
+    conditions = ["(m.text IS NOT NULL OR m.attributedBody IS NOT NULL)", "m.date >= ?"]
+    params = [cutoff_apple]
 
-    where_handles = " OR ".join(handle_conditions)
+    # Narrow by handles if provided
+    if handles:
+        handle_conditions = []
+        for h in handles:
+            if "@" in h:
+                handle_conditions.append("LOWER(h.id) = ?")
+                params.append(h.lower())
+            else:
+                norm = normalize_phone(h)
+                if norm:
+                    handle_conditions.append("h.id LIKE ?")
+                    params.append(f"%{norm[-10:]}")
+        if handle_conditions:
+            conditions.append(f"({' OR '.join(handle_conditions)})")
+
+    # If we have keywords, pre-filter with LIKE for speed
+    kw_list = [k.strip() for k in keywords if k.strip()]
+    if kw_list:
+        like_parts = []
+        for kw in kw_list:
+            like_parts.append("m.text LIKE ?")
+            params.append(f"%{kw}%")
+        conditions.append(f"({' OR '.join(like_parts)})")
+
+    where = " AND ".join(conditions)
     sql = f"""
         SELECT
             (m.date/1000000000+978307200) AS ts,
@@ -208,8 +223,7 @@ def search_messages(handles, keywords):
         JOIN handle h ON m.handle_id = h.ROWID
         LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-        WHERE ({where_handles})
-          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+        WHERE {where}
         ORDER BY (m.date/1000000000+978307200) DESC
     """
     rows = db_query(sql, tuple(params))
@@ -779,7 +793,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div id="tab-search" class="hidden">
       <div class="glass">
         <div class="field-group">
-          <label>Contact</label>
+          <label>Contact (optional — leave empty to search all)</label>
           <div class="contact-picker">
             <input type="text" id="contactInput" placeholder="Start typing a name or number..." autocomplete="off" />
             <div class="dropdown" id="contactDropdown"></div>
@@ -788,9 +802,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="field-group">
           <label>Keywords (comma separated)</label>
-          <input type="text" id="keywordInput" placeholder='e.g. cancel, unsubscribe' />
+          <input type="text" id="keywordInput" placeholder='e.g. cancel, notion.site, brook-spot' />
         </div>
-        <button class="btn" id="searchBtn" disabled>Search</button>
+        <div class="field-group">
+          <label>Time Range</label>
+          <select id="searchRange">
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 3 months</option>
+            <option value="180">Last 6 months</option>
+            <option value="365" selected>Last year</option>
+            <option value="730">Last 2 years</option>
+            <option value="9999">All time</option>
+          </select>
+        </div>
+        <button class="btn" id="searchBtn">Search</button>
       </div>
       <div id="searchResults" class="hidden"></div>
     </div>
@@ -907,13 +932,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       renderChips();
       contactInput.value = '';
       dropdown.classList.remove('open');
-      searchBtn.disabled = false;
     }
 
     function removeHandle(handle) {
       selectedHandles = selectedHandles.filter(h => h !== handle);
       renderChips();
-      searchBtn.disabled = selectedHandles.length === 0;
     }
 
     function renderChips() {
@@ -930,7 +953,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     searchBtn.addEventListener('click', async () => {
       const keywords = document.getElementById('keywordInput').value;
-      if (!selectedHandles.length) return;
+      const days = document.getElementById('searchRange').value;
+
+      if (!keywords.trim() && !selectedHandles.length) {
+        alert('Enter a keyword or select a contact (or both)');
+        return;
+      }
 
       const area = document.getElementById('searchResults');
       area.classList.remove('hidden');
@@ -939,7 +967,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       const res = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ handles: selectedHandles, keywords })
+        body: JSON.stringify({ handles: selectedHandles, keywords, days: parseInt(days) })
       });
       const data = await res.json();
       renderSearchResults(data);
@@ -1018,7 +1046,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/search":
             handles = body.get("handles", [])
             keywords = [k.strip() for k in body.get("keywords", "").split(",") if k.strip()]
-            result = search_messages(handles, keywords)
+            days = body.get("days", 365)
+            result = search_messages(handles, keywords, days=days)
             self._respond(200, "application/json", json.dumps(result).encode())
 
         elif path == "/api/emails":
